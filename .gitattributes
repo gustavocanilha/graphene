@@ -1,0 +1,11 @@
+# Fim de linha único no repositório: evita diff de arquivo inteiro entre Windows e Linux/macOS
+* text=auto eol=lf
+
+# Binários: nunca normalizar
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary

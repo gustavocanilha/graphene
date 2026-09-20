@@ -1,0 +1,16 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root { color-scheme: light; }
+html, body { height: 100%; }
+body { @apply bg-canvas text-ink-2 font-sans antialiased; }
+
+.xy-theme { --xy-background-color: #f6f5f4; --xy-node-border: #e6e6e6; }
+.react-flow__attribution { display: none; }
+.react-flow__edge-label { font-size: 11px; }
+.react-flow__handle { width: 10px; height: 10px; border: 2px solid #fff; box-shadow: 0 0 0 1px #e6e6e6; }
+.react-flow__node-input, .react-flow__node-default, .react-flow__node-output, .react-flow__node-group { border: none; background: none; background-color: transparent; box-shadow: none; padding: 0; width: auto; outline: none; }
+.react-flow__node { border-radius: 12px; }
+/* Mata sombra/borda padrão do hover/seleção só em input/output (seletor :is empata a especificidade da lib). Sem overflow:hidden no wrapper: cortaria os handles de conexão. */
+:is(.react-flow__node-input, .react-flow__node-default, .react-flow__node-output, .react-flow__node-group):is(.selectable:hover, .selectable.selected, .selectable:focus, .selectable:focus-visible) { border: none; background-color: transparent; box-shadow: none; outline: none; }

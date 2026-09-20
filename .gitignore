@@ -1,0 +1,48 @@
+# Dependências
+node_modules/
+.pnp
+.pnp.js
+.npm-cache/
+
+# Build e saída do Next
+.next/
+out/
+build/
+dist/
+
+# Caches e artefatos de ferramentas
+*.tsbuildinfo
+.eslintcache
+.cache/
+coverage/
+.test-build/
+
+# Variáveis de ambiente e credenciais — nunca subir
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.npmrc
+.netrc
+
+# Logs e temporários
+*.log
+npm-debug.log*
+yarn-error.log*
+*.tmp
+tmp/
+
+# Sistema operacional e editores
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/
+*.swp
+
+# Trilha de auditoria interna (findings, PoCs, KB) — mantida só na máquina local
+workspace/
+mantis-summary.md
