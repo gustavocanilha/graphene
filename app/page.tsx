@@ -11,6 +11,7 @@ import RightPanel from "@/components/RightPanel";
 import ValidationBar from "@/components/ValidationBar";
 import ExportModal from "@/components/ExportModal";
 import GraphsModal from "@/components/GraphsModal";
+import RunModal from "@/components/RunModal";
 import { autoLayout } from "@/lib/layout";
 import { KIND_LABEL, defaultData, nextLabel, uid, type PieceKind, type PieceNode } from "@/lib/types";
 import { toHermesSkill, toJsonPayload, toMarkdown, toPython } from "@/lib/export";
@@ -28,9 +29,9 @@ function demo(): PieceNode[] {
   return [mk("input", "input_1", 0), mk("worker", "worker_1", 300), mk("supervisor", "sup_1", 600), mk("output", "out_1", 900)];
 }
 const demoEdges: Edge[] = [
-  { id: "e1", source: "input_1", target: "worker_1", type: "bezier", label: "aprovado" },
+  { id: "e1", source: "input_1", target: "worker_1", type: "bezier", label: "segue" },
   { id: "e2", source: "worker_1", target: "sup_1", type: "bezier", label: "revisão" },
-  { id: "e3", source: "sup_1", target: "out_1", type: "bezier", label: "aprovado" },
+  { id: "e3", source: "sup_1", sourceHandle: "ok", target: "out_1", type: "bezier", label: "aprovado" },
   { id: "e4", source: "sup_1", sourceHandle: "loop", target: "worker_1", type: "bezier", label: "reprovado/feedback" },
 ];
 
@@ -46,6 +47,7 @@ function Editor() {
   const [graphName, setGraphName] = useState("default");
   const [showExport, setShowExport] = useState(false);
   const [showGraphs, setShowGraphs] = useState(false);
+  const [showRun, setShowRun] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
   const [saveState, setSaveState] = useState<SaveState>({ kind: "idle" });
   const [zoomLabel, setZoomLabel] = useState("100%");
@@ -56,6 +58,13 @@ function Editor() {
   const pending = useRef<{ fromNode: string; fromHandle: string | null; fromType: string } | null>(null);
   const [connectMenu, setConnectMenu] = useState<{ x: number; y: number; flow: { x: number; y: number }; fromNode: string; fromHandle: string | null; fromType: string } | null>(null);
   const rf = useReactFlow();
+
+  // Só as saídas do supervisor carregam decisão; as demais arestas são fluxo neutro.
+  const edgeLabel = useCallback((sourceId: string, sourceHandle?: string | null, sourceKind?: PieceKind): string => {
+    if (sourceHandle === "loop") return "reprovado/feedback";
+    const kind = sourceKind ?? (rf.getNode(sourceId)?.type as PieceKind | undefined);
+    return kind === "supervisor" ? "aprovado" : "segue";
+  }, [rf]);
 
   const flash = useCallback((msg: string) => {
     setToast(msg);
@@ -192,13 +201,12 @@ function Editor() {
   }, [setNodes]);
 
   const onConnect: OnConnect = useCallback((c) => {
-    const loop = c.sourceHandle === "loop";
     setEdges((es) => [...es, {
       id: uid("e"), source: c.source, target: c.target,
       sourceHandle: c.sourceHandle ?? undefined, targetHandle: c.targetHandle ?? undefined,
-      type: "bezier", label: loop ? "reprovado/feedback" : "aprovado",
+      type: "bezier", label: edgeLabel(c.source, c.sourceHandle),
     }]);
-  }, [setEdges]);
+  }, [setEdges, edgeLabel]);
 
   const onConnectStart: OnConnectStart = useCallback((_e, p) => {
     pending.current = p.nodeId ? { fromNode: p.nodeId, fromHandle: p.handleId, fromType: p.handleType ?? "source" } : null;
@@ -227,10 +235,9 @@ function Editor() {
     setNodes((ns) => [...ns.map((n) => ({ ...n, selected: false })), {
       id, type: kind, position: m.flow, data: defaultData(kind, ns), selected: true,
     } as PieceNode]);
-    const loop = m.fromHandle === "loop";
     setEdges((es) => [...es, m.fromType === "source"
-      ? { id: uid("e"), source: m.fromNode, sourceHandle: m.fromHandle ?? undefined, target: id, type: "bezier", label: loop ? "reprovado/feedback" : "aprovado" }
-      : { id: uid("e"), source: id, target: m.fromNode, type: "bezier", label: "aprovado" }]);
+      ? { id: uid("e"), source: m.fromNode, sourceHandle: m.fromHandle ?? undefined, target: id, type: "bezier", label: edgeLabel(m.fromNode, m.fromHandle) }
+      : { id: uid("e"), source: id, target: m.fromNode, type: "bezier", label: edgeLabel(id, undefined, kind) }]);
     setConnectMenu(null);
   };
 
@@ -275,7 +282,7 @@ function Editor() {
   // Teclado: Esc fecha camadas, Ctrl+S salva, Ctrl+Shift+E exporta, Del apaga, setas movem, Ctrl+D duplica.
   useEffect(() => {
     const h = (e: KeyboardEvent) => {
-      if (e.key === "Escape") { setConnectMenu(null); setShowExport(false); setShowGraphs(false); return; }
+      if (e.key === "Escape") { setConnectMenu(null); setShowExport(false); setShowGraphs(false); setShowRun(false); return; }
       const t = e.target as HTMLElement;
       if (t.closest("input, textarea, select, [contenteditable]")) return;
       const mod = e.ctrlKey || e.metaKey;
@@ -302,7 +309,9 @@ function Editor() {
 
   return (
     <div className="h-screen flex flex-col">
-      <Topbar graphTitle={title} status={saveState} onExport={() => setShowExport(true)}
+      <Topbar graphTitle={title} status={saveState}
+        onExport={() => { setShowRun(false); setShowExport(true); }}
+        onRun={() => { setShowExport(false); setShowRun(true); }}
         onClear={() => { setNodes([]); setEdges([]); }}
         onSave={saveNow} onManage={() => setShowGraphs(true)} onNew={newGraph} />
       <div className="flex-1 flex min-h-0">
@@ -336,6 +345,7 @@ function Editor() {
         <RightPanel node={selected} edges={edges} nodes={nodes} onPatch={patch} onDelete={remove} onFocusNode={focusNode} />
       </div>
       {showExport && exported && <ExportModal {...exported} onClose={() => setShowExport(false)} />}
+      {showRun && <RunModal nodes={nodes} edges={edges} title={title} onClose={() => setShowRun(false)} />}
       {showGraphs && <GraphsModal graphName={graphName} title={title} nodes={nodes} edges={edges}
         onOpen={openGraph} onSaved={(n) => { setGraphName(n); setTitle(n); }} onClose={() => setShowGraphs(false)} onImportFile={importFile} />}
       {toast && (

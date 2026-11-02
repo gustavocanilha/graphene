@@ -3,6 +3,7 @@ import { promises as fs } from "fs";
 import { homedir } from "os";
 import { join } from "path";
 import { normalizeGraph } from "@/lib/graph";
+import { badOrigin } from "@/lib/http";
 
 const DIR = join(homedir(), ".graphene");
 const MAX_NAME = 120;
@@ -14,17 +15,6 @@ async function ensure() {
 
 /** Nome -> arquivo dentro de ~/.graphene. A limpeza impede sair do diretório. */
 const file = (name: string) => join(DIR, `${name.replace(/[^a-z0-9-_]+/gi, "_").slice(0, MAX_NAME) || "default"}.graphene`);
-
-// CSRF: browsers enviam Origin em POST/DELETE; mesma origem tem host igual ao Host.
-function badOrigin(req: Request): boolean {
-  const origin = req.headers.get("origin");
-  if (!origin) return false;
-  try {
-    return new URL(origin).host !== new URL(req.url).host;
-  } catch {
-    return true;
-  }
-}
 
 type Body = { name: string; title: string; nodes: unknown[]; edges: unknown[] };
 

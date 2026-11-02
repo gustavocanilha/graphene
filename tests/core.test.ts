@@ -1,5 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import type { Edge } from "@xyflow/react";
 import { defaultData, nextLabel, type PieceKind, type PieceNode } from "../lib/types";
 import { countIssues, hasErrors, validateGraph } from "../lib/validate";
@@ -8,6 +10,8 @@ import { graphSignature, type GraphPayload } from "../lib/persist";
 import { edgeStyle, edgeTone } from "../lib/edges";
 import { normalizeGraph } from "../lib/graph";
 import { autoLayout } from "../lib/layout";
+import { callOpenAI, parseVerdict, runGraph, type CallModel, type ChatMessage } from "../lib/run";
+import { badOrigin } from "../lib/http";
 
 const N = (id: string, type: PieceKind, label: string): PieceNode => ({
   id, type, position: { x: 0, y: 0 },
@@ -58,8 +62,8 @@ test("toPython segue as arestas desenhadas", () => {
     E("e5", "w2", "s", "revisão"),
   ];
   const code = tail(toPython(nodes, edges));
-  assert.match(code, /add_conditional_edges\("supervisor_1_check", roteador, \{"aprovado": "entrega_1", "reprovado": "trabalhador_2"\}\)/);
-  assert.match(code, /builder\.add_edge\("trabalhador_2", "supervisor_1_check"\)/);
+  assert.match(code, /add_conditional_edges\("supervisor_1", roteador, \{"aprovado": "entrega_1", "reprovado": "trabalhador_2"\}\)/);
+  assert.match(code, /builder\.add_edge\("trabalhador_2", "supervisor_1"\)/);
   assert.match(code, /builder\.add_edge\("entrega_1", END\)/);
   assert.doesNotMatch(code, /"reprovado": "trabalhador_1"/, "loop não pode voltar ao primeiro trabalhador");
 });
@@ -68,7 +72,7 @@ test("toPython sem arestas cai no fluxo linear", () => {
   const nodes = [N("i", "input", "Entrada 1"), N("w", "worker", "Trabalhador 1"), N("s", "supervisor", "Supervisor 1"), N("o", "output", "Entrega 1")];
   const code = tail(toPython(nodes, []));
   assert.match(code, /builder\.add_edge\("entrada_1", "trabalhador_1"\)/);
-  assert.match(code, /builder\.add_edge\("trabalhador_1", "supervisor_1_check"\)/);
+  assert.match(code, /builder\.add_edge\("trabalhador_1", "supervisor_1"\)/);
   assert.match(code, /"reprovado": "trabalhador_1"/);
 });
 
@@ -128,4 +132,144 @@ test("normalizeGraph descarta lixo e mantém o grafo coerente", () => {
 test("autoLayout devolve o mesmo array quando não há nós", () => {
   const empty: PieceNode[] = [];
   assert.equal(autoLayout(empty, []), empty);
+});
+
+// --- Execução do grafo (lib/run.ts) ---
+
+const P = (id: string, type: PieceKind, label: string, systemPrompt: string, maxRetries = 5): PieceNode => ({
+  id, type, position: { x: 0, y: 0 }, data: { label, systemPrompt, maxRetries, feedback: "" },
+});
+const CFG = { baseUrl: "http://127.0.0.1:9/v1", model: "m", apiKey: "" };
+
+function loopGraph(maxRetries = 2) {
+  return {
+    nodes: [
+      P("i", "input", "Entrada 1", "receba"),
+      P("w", "worker", "Trabalhador 1", "trabalhe"),
+      P("s", "supervisor", "Supervisor 1", "julgue", maxRetries),
+      P("o", "output", "Entrega 1", "entregue"),
+    ],
+    edges: [
+      E("e1", "i", "w", "segue"), E("e2", "w", "s", "revisão"),
+      E("e3", "s", "o", "aprovado", "ok"), E("e4", "s", "w", "reprovado/feedback", "loop"),
+    ],
+  };
+}
+
+test("runGraph itera, leva o feedback de volta e entrega", async () => {
+  const { nodes, edges } = loopGraph(3);
+  const calls: ChatMessage[][] = [];
+  const call: CallModel = async (messages) => {
+    calls.push(messages);
+    const system = messages[0].content;
+    if (system === "julgue") {
+      const verdicts = calls.filter((c) => c[0].content === "julgue").length;
+      return {
+        text: verdicts === 1
+          ? '```json\n{"aprovado": false, "feedback": "faltou X"}\n```'
+          : '{"aprovado": true, "feedback": ""}',
+      };
+    }
+    return { text: system === "entregue" ? "FINAL" : "ARTEFATO" };
+  };
+
+  const r = await runGraph(nodes, edges, "pedido", CFG, call);
+  assert.deepEqual(r.steps.map((s) => s.kind), ["worker", "supervisor", "worker", "supervisor", "output"]);
+  assert.equal(r.rounds, 2);
+  assert.equal(r.approved, true);
+  assert.equal(r.capped, false);
+  assert.equal(r.final, "FINAL");
+  assert.equal(r.steps[1].approved, false);
+  assert.equal(r.steps[1].feedback, "faltou X");
+
+  const workers = calls.filter((c) => c[0].content === "trabalhe");
+  assert.doesNotMatch(workers[0][1].content, /faltou X/);
+  assert.match(workers[1][1].content, /faltou X/);
+  assert.match(workers[1][1].content, /ARTEFATO/, "o trabalhador vê o trabalho anterior");
+});
+
+test("runGraph para no teto de max_retries e entrega melhor esforço", async () => {
+  const { nodes, edges } = loopGraph(2);
+  let workers = 0;
+  const call: CallModel = async (messages) => {
+    if (messages[0].content === "julgue") return { text: '{"aprovado": false, "feedback": "ainda não"}' };
+    if (messages[0].content === "trabalhe") workers += 1;
+    return { text: messages[0].content === "entregue" ? "MELHOR ESFORÇO" : "ARTEFATO" };
+  };
+
+  const r = await runGraph(nodes, edges, "pedido", CFG, call);
+  assert.equal(workers, 2);
+  assert.equal(r.rounds, 2);
+  assert.equal(r.capped, true);
+  assert.equal(r.approved, true, "teto estourado ainda entrega");
+  assert.equal(r.final, "MELHOR ESFORÇO");
+  assert.deepEqual(r.steps.map((s) => s.kind), ["worker", "supervisor", "worker", "supervisor", "output"]);
+});
+
+test("parseVerdict aceita JSON, cerca de código e texto solto", () => {
+  assert.deepEqual(parseVerdict('{"aprovado": true, "feedback": ""}'), { approved: true, feedback: "" });
+  assert.deepEqual(parseVerdict('```json\n{"aprovado": false, "feedback": "falta X"}\n```'), { approved: false, feedback: "falta X" });
+  assert.deepEqual(parseVerdict("Reprovado: falta Y"), { approved: false, feedback: "Reprovado: falta Y" });
+  assert.deepEqual(parseVerdict("Aprovado sem ressalvas."), { approved: true, feedback: "" });
+  assert.equal(parseVerdict("Não aprovado: corrija.").approved, false);
+  assert.equal(parseVerdict('{"aprovado": "false"}').approved, false);
+  assert.throws(() => parseVerdict("ARTEFATO"), /sem veredito reconhecível/);
+});
+
+test("badOrigin compara a origem com o header Host", () => {
+  const req = (origin: string | null, host: string) => {
+    const headers = new Headers({ host });
+    if (origin) headers.set("origin", origin);
+    return new Request("http://127.0.0.1:3000/api/run", { headers });
+  };
+  assert.equal(badOrigin(req("http://127.0.0.1:3000", "127.0.0.1:3000")), false);
+  assert.equal(badOrigin(req(null, "127.0.0.1:3000")), false, "sem Origin passa (curl/CLI)");
+  assert.equal(badOrigin(req("http://localhost:3000", "127.0.0.1:3000")), true);
+  assert.equal(badOrigin(req("http://evil.test", "127.0.0.1:3000")), true);
+  assert.equal(badOrigin(req("http://evil.test", "")), true, "sem Host, nega");
+});
+
+test("toPython gera cliente HTTP real e supervisor ligado direto", () => {
+  const { nodes, edges } = loopGraph(2);
+  const py = toPython(nodes, edges);
+  assert.match(py, /def call_llm\(system: str, user: str\) -> str:/);
+  assert.match(py, /urllib\.request\.Request/);
+  assert.match(py, /def _parse_veredito\(texto: str\) -> dict:/);
+  assert.match(py, /\("supervisor_1", supervisor_1\)/);
+  assert.doesNotMatch(py, /TODO|_check/, "nada de nó morto ou chamada por fazer");
+  assert.match(py, /"input": "seu prompt aqui"/);
+});
+
+test("callOpenAI fala o protocolo /chat/completions", async () => {
+  let seenAuth = "";
+  let seenBody = "";
+  const server = createServer((req, res) => {
+    let raw = "";
+    req.on("data", (c) => { raw += c; });
+    req.on("end", () => {
+      seenAuth = String(req.headers.authorization ?? "");
+      seenBody = raw;
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        choices: [{ message: { content: "oi" } }],
+        usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+      }));
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const port = (server.address() as AddressInfo).port;
+  try {
+    const reply = await callOpenAI(
+      [{ role: "user", content: "x" }],
+      { baseUrl: `http://127.0.0.1:${port}/v1/`, model: "m", apiKey: "k" },
+    );
+    assert.equal(reply.text, "oi");
+    assert.equal(reply.usage?.total, 5);
+    assert.equal(seenAuth, "Bearer k");
+    const body = JSON.parse(seenBody) as { model: string; messages: { content: string }[] };
+    assert.equal(body.model, "m");
+    assert.equal(body.messages[0].content, "x");
+  } finally {
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
 });

@@ -4,9 +4,9 @@ import Image from "next/image";
 import type { SaveState } from "@/lib/persist";
 
 /** Barra superior: título, estado do autosave, ações do grafo e exportação. */
-export default function Topbar({ graphTitle, status, onClear, onExport, onSave, onManage, onNew }: {
+export default function Topbar({ graphTitle, status, onClear, onExport, onRun, onSave, onManage, onNew }: {
   graphTitle: string; status: SaveState;
-  onClear: () => void; onExport: () => void;
+  onClear: () => void; onExport: () => void; onRun: () => void;
   onSave: () => Promise<void>; onManage: () => void; onNew: () => void;
 }) {
   const [arming, setArming] = useState(false);
@@ -54,8 +54,10 @@ export default function Topbar({ graphTitle, status, onClear, onExport, onSave, 
         className="text-[13px] bg-surface border border-hairline rounded-md px-3 py-1.5 hover:bg-wash text-ink-2 disabled:opacity-60">
         Salvar
       </button>
-      <button onClick={onExport} title="Exportar para a IA (Ctrl+Shift+E)"
-        className="text-[13px] font-medium bg-primary hover:bg-primary-press text-white rounded-md px-4 py-1.5">Exportar para a IA</button>
+      <button onClick={onExport} title="Exportar o grafo (Ctrl+Shift+E)"
+        className="text-[13px] bg-surface border border-hairline rounded-md px-3 py-1.5 hover:bg-wash text-ink-2">Exportar</button>
+      <button onClick={onRun} title="Executar o grafo com um endpoint OpenAI-compatible"
+        className="text-[13px] font-medium bg-primary hover:bg-primary-press text-white rounded-md px-4 py-1.5">Executar</button>
     </header>
   );
 }

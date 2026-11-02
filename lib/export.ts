@@ -11,16 +11,18 @@ function pyStr(s: string): string {
 }
 
 /**
- * 1. Python LangGraph executável: TypedDict + nós puros + conditional_edges + trava max_retries.
- * A fiação segue as arestas desenhadas; sem aresta, cai no fluxo linear padrão.
+ * 1. Python LangGraph executável: TypedDict + nós que chamam um endpoint OpenAI-compatible
+ * + conditional_edges + trava max_retries. A fiação segue as arestas desenhadas; sem aresta,
+ * cai no fluxo linear padrão.
  */
 export function toPython(nodes: PieceNode[], edges: Edge[]): string {
   const sup = nodes.find((n) => n.type === "supervisor");
-  const maxRetries = Number(sup?.data.maxRetries ?? 5);
   const workers = nodes.filter((n) => n.type === "worker");
   const mainWorker = workers[0];
   const output = nodes.find((n) => n.type === "output");
   const input = nodes.find((n) => n.type === "input");
+  const rawMax = Number(sup?.data.maxRetries);
+  const maxRetries = Number.isFinite(rawMax) ? Math.max(0, Math.floor(rawMax)) : 5;
 
   const fnNames = new Map<string, string>();
   const used = new Set<string>();
@@ -31,26 +33,36 @@ export function toPython(nodes: PieceNode[], edges: Edge[]): string {
     fnNames.set(n.id, base);
   }
 
+  const doc = (n: PieceNode) =>
+    `"""${String(n.type).toUpperCase()}: ${String(n.data.label).replace(/\\/g, "\\\\").replace(/"/g, "'")}"""`;
   const nodeBlocks = nodes.map((n) => {
     const fn = fnNames.get(n.id)!;
-    return `def ${fn}(state: GraphState) -> GraphState:\n    """${String(n.type).toUpperCase()}: ${String(n.data.label).replace(/"/g, "'")}"""\n    system = ${pyStr(String(n.data.systemPrompt || ""))}\n    # TODO: chamar seu LLM aqui com system + state["input"]\n    # resp = llm(system, state["artefato"] or state["input"])\n    return {**state, "artefato": state.get("artefato") or state["input"], "tentativas": state.get("tentativas", 0) + 1}`;
+    const system = pyStr(String(n.data.systemPrompt || ""));
+    if (n.type === "input") {
+      return `def ${fn}(state: GraphState) -> GraphState:\n    ${doc(n)}\n    return {**state, "artefato": state["input"]}`;
+    }
+    if (n.type === "supervisor") {
+      return `def ${fn}(state: GraphState) -> GraphState:\n    ${doc(n)}\n    system = ${system}\n    user = (\n        "Artefato a avaliar:\\n" + state.get("artefato", "")\n        + '\\n\\nResponda APENAS com JSON: {"aprovado": true, "feedback": "..."}'\n    )\n    veredito = _parse_veredito(call_llm(system, user))\n    return {\n        **state,\n        "aprovado": veredito["aprovado"],\n        "feedback": veredito["feedback"],\n        "tentativas": state.get("tentativas", 0) + (0 if veredito["aprovado"] else 1),\n    }`;
+    }
+    if (n.type === "output") {
+      return `def ${fn}(state: GraphState) -> GraphState:\n    ${doc(n)}\n    system = ${system}\n    user = f"Pedido original:\\n{state['input']}\\n\\nArtefato aprovado:\\n{state.get('artefato', '')}\\n\\nEntregue a resposta final."\n    return {**state, "artefato": call_llm(system, user)}`;
+    }
+    return `def ${fn}(state: GraphState) -> GraphState:\n    ${doc(n)}\n    system = ${system}\n    if state.get("feedback"):\n        user = f"Objetivo:\\n{state['input']}\\n\\nTrabalho anterior:\\n{state.get('artefato', '')}\\n\\nFeedback do supervisor:\\n{state['feedback']}\\n\\nRefaça corrigindo o feedback."\n    elif state.get("artefato"):\n        user = f"Objetivo:\\n{state['input']}\\n\\nTrabalho anterior:\\n{state.get('artefato', '')}\\n\\nContinue a partir do trabalho anterior."\n    else:\n        user = f"Objetivo:\\n{state['input']}\\n\\nProduza o artefato."\n    return {**state, "artefato": call_llm(system, user)}`;
   }).join("\n\n\n");
 
   const entryFn = input ? fnNames.get(input.id)! : fnNames.get(nodes[0]?.id ?? "") ?? "entrada";
   const workerFn = mainWorker ? fnNames.get(mainWorker.id)! : entryFn;
   const supFn = sup ? fnNames.get(sup.id)! : workerFn;
-  const outFn = output ? fnNames.get(output.id)! : workerFn;
 
   // Alvos das arestas realmente desenhadas; fallback no fluxo linear quando a aresta não existe.
   const supOut = sup ? edges.filter((e) => e.source === sup.id) : [];
   const isLoopEdge = (e: Edge) => /loop|reprov|feedback/i.test(`${e.sourceHandle ?? ""} ${String(e.label ?? "")}`);
   const okEdge = supOut.find((e) => e.sourceHandle === "ok") ?? supOut.find((e) => !isLoopEdge(e));
   const loopEdge = supOut.find((e) => e.sourceHandle === "loop") ?? supOut.find(isLoopEdge);
-  const approvedFn = (okEdge && fnNames.get(okEdge.target)) || outFn;
+  const approvedFn = (okEdge && fnNames.get(okEdge.target)) || (output ? fnNames.get(output.id)! : "END");
   const loopFn = (loopEdge && fnNames.get(loopEdge.target)) || workerFn;
 
-  // Arestas viram add_edge; o supervisor entra pelo shim _check e sai por conditional_edges.
-  const nameInFlow = (id: string) => (sup && id === sup.id ? `${supFn}_check` : fnNames.get(id));
+  // Arestas viram add_edge; o supervisor sai por conditional_edges.
   const wires: string[] = [];
   const seen = new Set<string>();
   const wire = (from: string, to: string, rawTo = false) => {
@@ -61,20 +73,33 @@ export function toPython(nodes: PieceNode[], edges: Edge[]): string {
   };
   for (const e of edges) {
     if (sup && e.source === sup.id) continue;
-    const from = nameInFlow(e.source);
-    const to = nameInFlow(e.target);
+    const from = fnNames.get(e.source);
+    const to = fnNames.get(e.target);
     if (from && to) wire(from, to);
   }
-  if (!edges.some((e) => e.source === input?.id)) wire(entryFn, workerFn);
-  if (!edges.some((e) => e.source === mainWorker?.id)) wire(workerFn, `${supFn}_check`);
-  const outNodes = nodes.filter((n) => n.type === "output");
-  if (outNodes.length) outNodes.forEach((n) => wire(fnNames.get(n.id)!, "END", true));
-  else wire(outFn, "END", true);
+  if (input && !edges.some((e) => e.source === input.id)) {
+    if (mainWorker) wire(entryFn, workerFn);
+    else if (sup) wire(entryFn, supFn);
+  }
+  if (mainWorker && sup && !edges.some((e) => e.source === mainWorker.id)) wire(workerFn, supFn);
+  for (const n of nodes.filter((x) => x.type === "output")) wire(fnNames.get(n.id)!, "END", true);
 
-  const feedback = String(sup?.data.feedback || "Aponte o defeito exato e como corrigir.").replace(/"/g, "'");
+  const router = sup ? `def roteador(state: GraphState) -> str:
+    if state.get("aprovado"):
+        return "aprovado"
+    if state.get("tentativas", 0) >= ${maxRetries}:
+        return "aprovado"  # trava max_retries: entrega melhor esforço
+    return "reprovado"` : "";
+  const conditional = sup
+    ? `builder.add_conditional_edges("${supFn}", roteador, {"aprovado": "${approvedFn}", "reprovado": "${loopFn}"})`
+    : "";
 
   return `# Gerado por Graphene — LangGraph executável
 # pip install langgraph
+# Variáveis: OPENAI_API_KEY, OPENAI_BASE_URL (padrão https://api.openai.com/v1) e OPENAI_MODEL (padrão gpt-4o-mini).
+import json
+import os
+import urllib.request
 from typing import TypedDict
 from langgraph.graph import StateGraph, END
 
@@ -83,40 +108,63 @@ class GraphState(TypedDict):
     input: str
     artefato: str
     aprovado: bool
+    feedback: str
     tentativas: int
+
+
+def call_llm(system: str, user: str) -> str:
+    base = (os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/")
+    key = os.environ.get("OPENAI_API_KEY") or ""
+    model = os.environ.get("OPENAI_MODEL") or "gpt-4o-mini"
+    body = json.dumps({
+        "model": model,
+        "temperature": 0.7,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    req = urllib.request.Request(f"{base}/chat/completions", data=body, headers=headers)
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    return data["choices"][0]["message"]["content"]
+
+
+def _parse_veredito(texto: str) -> dict:
+    limpo = texto.replace("\`\`\`json", "").replace("\`\`\`", "").strip()
+    inicio, fim = limpo.find("{"), limpo.rfind("}")
+    if inicio >= 0 and fim > inicio:
+        try:
+            d = json.loads(limpo[inicio:fim + 1])
+            if isinstance(d.get("aprovado"), bool):
+                return {"aprovado": d["aprovado"], "feedback": str(d.get("feedback", ""))}
+        except json.JSONDecodeError:
+            pass
+    baixo = limpo.lower()
+    reprovado = "reprovad" in baixo or "não aprovad" in baixo or "nao aprovad" in baixo
+    aprovado = not reprovado and "aprovad" in baixo
+    return {"aprovado": aprovado, "feedback": "" if aprovado else limpo[:2000]}
 
 
 ${nodeBlocks}
 
-
-def roteador(state: GraphState) -> str:
-    if state.get("aprovado"):
-        return "aprovado"
-    if state.get("tentativas", 0) >= ${maxRetries}:
-        return "aprovado"  # trava max_retries: entrega melhor esforço
-    return "reprovado"
-
-
-def ${supFn}_check(state: GraphState) -> GraphState:
-    """Supervisor: avalie state['artefato'] contra os critérios.
-    Feedback loop: "${feedback}"
-    Defina state['aprovado'] = True/False aqui (ou via LLM juiz)."""
-    return {**state, "aprovado": state.get("aprovado", False)}
-
+${router}
 
 builder = StateGraph(GraphState)
 for nome, fn in [${nodes.map((n) => `("${fnNames.get(n.id)}", ${fnNames.get(n.id)})`).join(", ")}]:
     builder.add_node(nome, fn)
-builder.add_node("${supFn}_check", ${supFn}_check)
 
 builder.set_entry_point("${entryFn}")
 ${wires.join("\n")}
-builder.add_conditional_edges("${supFn}_check", roteador, {"aprovado": "${approvedFn}", "reprovado": "${loopFn}"})
+${conditional}
 
 grafo = builder.compile()
 
 if __name__ == "__main__":
-    final = grafo.invoke({"input": "seu prompt aqui", "artefato": "", "aprovado": False, "tentativas": 0})
+    final = grafo.invoke({"input": "seu prompt aqui", "artefato": "", "aprovado": False, "feedback": "", "tentativas": 0})
     print(final["artefato"])
 `;
 }
